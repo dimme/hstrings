@@ -28,6 +28,7 @@
 #endif
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -483,9 +484,38 @@ struct hit {
     size_t len;
 };
 
+/* A growable byte buffer; each pass writes its output into one so that
+   passes can run in parallel and still be printed in order. */
+struct outbuf {
+    unsigned char *data;
+    size_t len, cap;
+};
+
+static int outbuf_append(struct outbuf *ob, const void *src, size_t n)
+{
+    if (ob->len + n > ob->cap) {
+        size_t new_cap = ob->cap ? ob->cap : 4096;
+        unsigned char *grown;
+        while (new_cap < ob->len + n) new_cap *= 2;
+        grown = realloc(ob->data, new_cap);
+        if (grown == NULL) return -1;
+        ob->data = grown;
+        ob->cap = new_cap;
+    }
+    memcpy(ob->data + ob->len, src, n);
+    ob->len += n;
+    return 0;
+}
+
+static int outbuf_puts(struct outbuf *ob, const char *str)
+{
+    return outbuf_append(ob, str, strlen(str));
+}
+
 struct emitter {
     const struct options *opt;
     const struct pass *passes;
+    struct outbuf *out;         /* where direct-mode output goes */
 
     /* run being accumulated */
     unsigned char *run;
@@ -514,21 +544,22 @@ static uint64_t fnv1a(const unsigned char *s, size_t n)
     return h;
 }
 
-static void print_label(const struct emitter *em, const struct pass *p, enum enc e)
+static void format_label(char *dst, size_t cap, const struct options *opt,
+                         const struct pass *p, enum enc e)
 {
-    if (em->opt->use_color) {
-        printf("%s%s%s%s", p->color, p->label, enc_suffix[e], COLOR_RESET);
+    if (opt->use_color) {
+        snprintf(dst, cap, "%s%s%s%s", p->color, p->label, enc_suffix[e], COLOR_RESET);
     } else {
-        printf("%s%s", p->label, enc_suffix[e]);
+        snprintf(dst, cap, "%s%s", p->label, enc_suffix[e]);
     }
 }
 
-static void print_offset(size_t off, char radix)
+static void format_offset(char *dst, size_t cap, size_t off, char radix)
 {
     switch (radix) {
-    case 'x': printf("%7zx ", off); break;
-    case 'o': printf("%7zo ", off); break;
-    default:  printf("%7zu ", off); break;
+    case 'x': snprintf(dst, cap, "%7zx ", off); break;
+    case 'o': snprintf(dst, cap, "%7zo ", off); break;
+    default:  snprintf(dst, cap, "%7zu ", off); break;
     }
 }
 
@@ -556,34 +587,62 @@ static int table_rebuild(struct emitter *em)
 static int hit_cmp(const void *a, const void *b)
 {
     const struct hit *x = a, *y = b;
+    int c;
     if (x->score != y->score) return (x->score > y->score) ? -1 : 1;
     if (x->len != y->len) return (x->len > y->len) ? -1 : 1;
     if (x->pass_idx != y->pass_idx) return (x->pass_idx < y->pass_idx) ? -1 : 1;
+    if (x->enc != y->enc) return (x->enc < y->enc) ? -1 : 1;
     if (x->offset != y->offset) return (x->offset < y->offset) ? -1 : 1;
-    return 0;
+    c = memcmp(x->text, y->text, x->len);
+    return c;
 }
 
-/* Keep only the best 'top' hits once the table has grown to its limit. */
+/* Whether occurrence a would be found before occurrence b in a sequential
+   sweep: lower pass, then encoding, then byte alignment, then offset.  Used
+   to pick one canonical occurrence of a duplicated string, so the output does
+   not depend on which thread happened to see it first. */
+static int occurrence_earlier(size_t a_pass, enum enc a_enc, size_t a_off,
+                              size_t b_pass, enum enc b_enc, size_t b_off)
+{
+    size_t a_align, b_align;
+    if (a_pass != b_pass) return a_pass < b_pass;
+    if (a_enc != b_enc) return a_enc < b_enc;
+    a_align = a_off % enc_unit[a_enc];
+    b_align = b_off % enc_unit[b_enc];
+    if (a_align != b_align) return a_align < b_align;
+    return a_off < b_off;
+}
+
+/*
+ * Once the table has grown to its limit, keep only the best 'top' hits.
+ * Hits tied with the last kept score are kept too, and afterwards only hits
+ * scoring strictly below that floor are refused.  So nothing that could still
+ * make the final cut is ever lost, and merging per-thread tables gives the
+ * same answer as one sequential sweep.
+ */
 static int hits_truncate(struct emitter *em)
 {
-    size_t i;
+    size_t i, cut = em->opt->top;
 
     qsort(em->hits, em->n_hits, sizeof(*em->hits), hit_cmp);
-    for (i = em->opt->top; i < em->n_hits; i++) {
+    em->floor = em->hits[cut - 1].score;
+    while (cut < em->n_hits && em->hits[cut].score == em->floor) cut++;
+    for (i = cut; i < em->n_hits; i++) {
         free(em->hits[i].text);
     }
-    em->n_hits = em->opt->top;
-    em->floor = em->hits[em->n_hits - 1].score;
+    em->n_hits = cut;
     return table_rebuild(em);
 }
 
-static void emit_ranked(struct emitter *em, size_t pass_idx, enum enc e,
-                        size_t offset, const unsigned char *s, size_t n)
+/* Record a string with a known score; 'count' is how many times it was
+   seen, so that per-thread tables can be merged with their counts intact. */
+static void hits_insert(struct emitter *em, size_t pass_idx, enum enc e,
+                        size_t offset, const unsigned char *s, size_t n,
+                        float score, size_t count)
 {
     uint64_t h = fnv1a(s, n);
     size_t slot;
     struct hit *hit;
-    float score;
 
     if (em->oom) return;
 
@@ -592,21 +651,28 @@ static void emit_ranked(struct emitter *em, size_t pass_idx, enum enc e,
         while (em->table[slot] != 0) {
             hit = &em->hits[em->table[slot] - 1];
             if (hit->hash == h && hit->len == n && memcmp(hit->text, s, n) == 0) {
-                hit->count++;
+                hit->count += count;
+                if (occurrence_earlier(pass_idx, e, offset,
+                                       hit->pass_idx, hit->enc, hit->offset)) {
+                    hit->pass_idx = pass_idx;
+                    hit->enc = e;
+                    hit->offset = offset;
+                }
                 return;
             }
             slot = (slot + 1) & (em->table_size - 1);
         }
     }
 
-    score = readability(s, n);
-    if (em->opt->top > 0 && em->n_hits >= em->opt->top && score <= em->floor) {
+    if (em->opt->top > 0 && em->n_hits >= em->opt->top && score < em->floor) {
         return;
     }
 
     if (em->n_hits == em->cap_hits) {
         if (em->opt->top > 0 && em->n_hits >= em->limit) {
             if (hits_truncate(em) != 0) { em->oom = 1; return; }
+            /* A table full of ties cannot shrink; let it grow instead. */
+            if (em->n_hits == em->cap_hits) em->limit = em->cap_hits * 2;
         }
         if (em->n_hits == em->cap_hits) {
             size_t new_cap = em->cap_hits ? em->cap_hits * 2 : 256;
@@ -625,7 +691,7 @@ static void emit_ranked(struct emitter *em, size_t pass_idx, enum enc e,
     hit->len = n;
     hit->score = score;
     hit->offset = offset;
-    hit->count = 1;
+    hit->count = count;
     hit->pass_idx = pass_idx;
     hit->enc = e;
     hit->hash = h;
@@ -634,6 +700,26 @@ static void emit_ranked(struct emitter *em, size_t pass_idx, enum enc e,
     slot = (size_t)h & (em->table_size - 1);
     while (em->table[slot] != 0) slot = (slot + 1) & (em->table_size - 1);
     em->table[slot] = em->n_hits;
+}
+
+static void emit_ranked(struct emitter *em, size_t pass_idx, enum enc e,
+                        size_t offset, const unsigned char *s, size_t n)
+{
+    /* Score only strings not already in the table: the lookup in
+       hits_insert is cheap, the score is not. */
+    uint64_t h = fnv1a(s, n);
+    if (em->table_size > 0) {
+        size_t slot = (size_t)h & (em->table_size - 1);
+        while (em->table[slot] != 0) {
+            struct hit *hit = &em->hits[em->table[slot] - 1];
+            if (hit->hash == h && hit->len == n && memcmp(hit->text, s, n) == 0) {
+                hit->count++;
+                return;
+            }
+            slot = (slot + 1) & (em->table_size - 1);
+        }
+    }
+    hits_insert(em, pass_idx, e, offset, s, n, readability(s, n), 1);
 }
 
 /* A complete run of at least min_len printable characters was found. */
@@ -646,15 +732,22 @@ static void emit(struct emitter *em, size_t pass_idx, enum enc e,
     }
 
     if (!em->header_done) {
-        print_label(em, &em->passes[pass_idx], e);
-        printf(":\n");
+        char label[128];
+        format_label(label, sizeof(label), em->opt, &em->passes[pass_idx], e);
+        if (outbuf_puts(em->out, label) != 0 || outbuf_puts(em->out, ":\n") != 0) {
+            em->oom = 1;
+            return;
+        }
         em->header_done = 1;
     }
     if (em->opt->radix) {
-        print_offset(offset, em->opt->radix);
+        char off[32];
+        format_offset(off, sizeof(off), offset, em->opt->radix);
+        if (outbuf_puts(em->out, off) != 0) { em->oom = 1; return; }
     }
-    fwrite(s, 1, n, stdout);
-    putchar('\n');
+    if (outbuf_append(em->out, s, n) != 0 || outbuf_append(em->out, "\n", 1) != 0) {
+        em->oom = 1;
+    }
 }
 
 static int run_push(struct emitter *em, unsigned char c)
@@ -1024,6 +1117,8 @@ static void usage(FILE *out)
 "                        likely to be human readable first\n"
 "      --top=N           with --rank, print only the best N (default %d,\n"
 "                        0 for all)\n"
+"  -j, --threads=N       run N passes in parallel (default: one per CPU);\n"
+"                        the output is the same whatever N is\n"
 "\n"
 "Transform options (default: every one of them except --rotxor):\n"
 "      --xor[=KEY]       every single-byte XOR key, or just KEY; KEY is a\n"
@@ -1207,11 +1302,15 @@ static void print_ranked(struct emitter *em)
         const struct pass *p = &em->passes[h->pass_idx];
         size_t w = strlen(p->label) + strlen(enc_suffix[h->enc]);
 
+        char text[128];
+
         printf("%3d  ", (int)(h->score * 100.0f + 0.5f));
-        print_label(em, p, h->enc);
+        format_label(text, sizeof(text), em->opt, p, h->enc);
+        fputs(text, stdout);
         printf("%*s  ", (int)(width - w), "");
         if (em->opt->radix) {
-            print_offset(h->offset, em->opt->radix);
+            format_offset(text, sizeof(text), h->offset, em->opt->radix);
+            fputs(text, stdout);
         }
         fwrite(h->text, 1, h->len, stdout);
         if (h->count > 1) {
@@ -1221,15 +1320,169 @@ static void print_ranked(struct emitter *em)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* Parallel sweep                                                             */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Passes are independent, so a pool of threads takes them from a shared
+ * counter.  Each thread has its own work buffer and emitter and writes a
+ * pass's output into that pass's slot; the main thread prints the slots in
+ * pass order, so the output is the same whatever the thread count.  A thread
+ * may run at most 'window' passes ahead of the printer, which bounds the
+ * memory held in finished-but-unprinted slots.
+ */
+struct sweep {
+    const struct pass *passes;
+    size_t n_passes;
+    const unsigned char *buf;
+    size_t len;
+    const int *enabled;
+    const struct options *opt;
+
+    pthread_mutex_t lock;
+    pthread_cond_t slot_done;
+    pthread_cond_t slot_freed;
+    size_t next_pass;
+    size_t printed;             /* passes already written to stdout */
+    size_t window;
+    struct outbuf *slots;
+    unsigned char *done;
+    int failed;
+};
+
+struct worker {
+    struct sweep *sw;
+    pthread_t thread;
+    struct emitter em;
+    unsigned char *work;
+};
+
+static int run_pass(struct worker *w, size_t p)
+{
+    struct sweep *sw = w->sw;
+    const struct pass *ps = &sw->passes[p];
+    int e;
+
+    w->em.out = &sw->slots[p];
+
+    if (ps->op == OP_BASE64) {
+        if (scan_base64(&w->em, p, sw->buf, sw->len) != 0) return -1;
+    } else if (ps->op == OP_HEX) {
+        if (scan_hex(&w->em, p, sw->buf, sw->len) != 0) return -1;
+    } else {
+        apply_pass(ps, sw->buf, sw->len, w->work);
+        for (e = 0; e < ENC_COUNT; e++) {
+            if (sw->enabled[e] && scan(&w->em, p, w->work, sw->len, (enum enc)e) != 0) {
+                return -1;
+            }
+        }
+    }
+    return w->em.oom ? -1 : 0;
+}
+
+static void sweep_fail(struct sweep *sw)
+{
+    pthread_mutex_lock(&sw->lock);
+    sw->failed = 1;
+    pthread_cond_broadcast(&sw->slot_done);
+    pthread_cond_broadcast(&sw->slot_freed);
+    pthread_mutex_unlock(&sw->lock);
+}
+
+static void *worker_main(void *arg)
+{
+    struct worker *w = arg;
+    struct sweep *sw = w->sw;
+
+    for (;;) {
+        size_t p;
+
+        pthread_mutex_lock(&sw->lock);
+        while (!sw->failed && sw->next_pass < sw->n_passes
+               && sw->next_pass >= sw->printed + sw->window) {
+            pthread_cond_wait(&sw->slot_freed, &sw->lock);
+        }
+        if (sw->failed || sw->next_pass >= sw->n_passes) {
+            pthread_mutex_unlock(&sw->lock);
+            break;
+        }
+        p = sw->next_pass++;
+        pthread_mutex_unlock(&sw->lock);
+
+        if (run_pass(w, p) != 0) {
+            sweep_fail(sw);
+            break;
+        }
+
+        pthread_mutex_lock(&sw->lock);
+        sw->done[p] = 1;
+        pthread_cond_broadcast(&sw->slot_done);
+        pthread_mutex_unlock(&sw->lock);
+    }
+    return NULL;
+}
+
+/* Print the slots in pass order as they complete.  Returns -1 on failure. */
+static int sweep_print(struct sweep *sw)
+{
+    size_t p;
+
+    for (p = 0; p < sw->n_passes; p++) {
+        struct outbuf *ob = &sw->slots[p];
+
+        pthread_mutex_lock(&sw->lock);
+        while (!sw->done[p] && !sw->failed) {
+            pthread_cond_wait(&sw->slot_done, &sw->lock);
+        }
+        if (sw->failed) {
+            pthread_mutex_unlock(&sw->lock);
+            return -1;
+        }
+        pthread_mutex_unlock(&sw->lock);
+
+        if (ob->len > 0) fwrite(ob->data, 1, ob->len, stdout);
+        free(ob->data);
+        ob->data = NULL;
+        ob->len = ob->cap = 0;
+
+        pthread_mutex_lock(&sw->lock);
+        sw->printed = p + 1;
+        pthread_cond_broadcast(&sw->slot_freed);
+        pthread_mutex_unlock(&sw->lock);
+    }
+    return 0;
+}
+
+static size_t default_threads(void)
+{
+#if defined(_SC_NPROCESSORS_ONLN)
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0) return (size_t)n;
+#endif
+    return 1;
+}
+
+static void emitter_free(struct emitter *em)
+{
+    size_t i;
+    for (i = 0; i < em->n_hits; i++) free(em->hits[i].text);
+    free(em->hits);
+    free(em->table);
+    free(em->run);
+}
+
 int main(int argc, char *argv[])
 {
     struct options opt = { DEFAULT_MIN_LEN, 0, 0, 0, 0 };
     struct selection sel;
     struct pass_list pl = { NULL, 0, 0 };
     struct emitter em;
+    struct sweep sw;
+    struct worker *workers = NULL;
+    size_t n_threads = 0, n_started = 0, w;
     int enabled[ENC_COUNT] = { 1, 1, 0, 0, 0 };
     unsigned char *buf = NULL;
-    unsigned char *work = NULL;
     size_t len = 0;
     const char *path = NULL;
     FILE *file = stdin;
@@ -1244,6 +1497,7 @@ int main(int argc, char *argv[])
     sel.guess_len = DEFAULT_GUESS_LEN;
     memset(&em, 0, sizeof(em));
     em.opt = &opt;
+    memset(&sw, 0, sizeof(sw));
 
     if (argc > 0 && argv[0] != NULL && argv[0][0] != '\0') {
         progname = argv[0];
@@ -1306,6 +1560,13 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "%s: invalid colour mode '%s'\n", progname, val);
                 goto out;
             }
+        } else if (strncmp(arg, "--threads=", 10) == 0 || arg[1] == 'j') {
+            if ((val = option_value(argc, argv, &i, arg, 10)) == NULL) goto out;
+            if (parse_uint(val, &n, 10) != 0 || n < 1 || n > 1024) {
+                fprintf(stderr, "%s: invalid thread count '%s' (1..1024)\n", progname, val);
+                goto out;
+            }
+            n_threads = (size_t)n;
         } else if (strcmp(arg, "--rank") == 0) {
             opt.rank = 1;
         } else if (strncmp(arg, "--top=", 6) == 0) {
@@ -1381,9 +1642,6 @@ int main(int argc, char *argv[])
         goto out;
     }
 
-    work = malloc(len > 0 ? len : 1);
-    if (work == NULL) goto nomem;
-
     if (build_passes(&pl, &sel, buf, len) != 0) goto nomem;
     em.passes = pl.v;
     em.limit = (opt.top * 2 > 1024) ? opt.top * 2 : 1024;
@@ -1397,27 +1655,70 @@ int main(int argc, char *argv[])
     /* One big output buffer: the sweep writes well over a thousand passes. */
     setvbuf(stdout, NULL, _IOFBF, 1 << 20);
 
-    for (p = 0; p < pl.n; p++) {
-        const struct pass *ps = &pl.v[p];
-        int e;
+    if (n_threads == 0) n_threads = default_threads();
+    if (n_threads > pl.n) n_threads = pl.n;
+    if (n_threads == 0) n_threads = 1;
 
-        if (ps->op == OP_BASE64) {
-            if (scan_base64(&em, p, buf, len) != 0) goto nomem;
-            continue;
-        }
-        if (ps->op == OP_HEX) {
-            if (scan_hex(&em, p, buf, len) != 0) goto nomem;
-            continue;
-        }
-
-        apply_pass(ps, buf, len, work);
-        for (e = 0; e < ENC_COUNT; e++) {
-            if (enabled[e] && scan(&em, p, work, len, (enum enc)e) != 0) goto nomem;
-        }
+    sw.passes = pl.v;
+    sw.n_passes = pl.n;
+    sw.buf = buf;
+    sw.len = len;
+    sw.enabled = enabled;
+    sw.opt = &opt;
+    sw.window = n_threads * 4;
+    sw.slots = calloc(pl.n > 0 ? pl.n : 1, sizeof(*sw.slots));
+    sw.done = calloc(pl.n > 0 ? pl.n : 1, sizeof(*sw.done));
+    workers = calloc(n_threads, sizeof(*workers));
+    if (sw.slots == NULL || sw.done == NULL || workers == NULL) goto nomem;
+    if (pthread_mutex_init(&sw.lock, NULL) != 0
+        || pthread_cond_init(&sw.slot_done, NULL) != 0
+        || pthread_cond_init(&sw.slot_freed, NULL) != 0) {
+        fprintf(stderr, "%s: cannot initialise threads\n", progname);
+        goto out;
     }
 
-    if (em.oom) goto nomem;
-    if (opt.rank) print_ranked(&em);
+    for (w = 0; w < n_threads; w++) {
+        workers[w].sw = &sw;
+        workers[w].em.opt = &opt;
+        workers[w].em.passes = pl.v;
+        workers[w].em.limit = em.limit;
+        workers[w].work = malloc(len > 0 ? len : 1);
+        if (workers[w].work == NULL) goto nomem;
+    }
+    for (w = 0; w < n_threads; w++) {
+        if (pthread_create(&workers[w].thread, NULL, worker_main, &workers[w]) != 0) {
+            /* Carry on with the threads that did start, if any. */
+            if (w == 0) {
+                fprintf(stderr, "%s: cannot create thread: %s\n", progname, strerror(errno));
+                goto out;
+            }
+            break;
+        }
+        n_started++;
+    }
+
+    if (sweep_print(&sw) != 0) {
+        for (w = 0; w < n_started; w++) pthread_join(workers[w].thread, NULL);
+        n_started = 0;
+        goto nomem;
+    }
+    for (w = 0; w < n_started; w++) pthread_join(workers[w].thread, NULL);
+    n_started = 0;
+    if (sw.failed) goto nomem;
+
+    if (opt.rank) {
+        /* Merge the per-thread tables, then rank the union. */
+        for (w = 0; w < n_threads; w++) {
+            const struct emitter *we = &workers[w].em;
+            for (p = 0; p < we->n_hits; p++) {
+                const struct hit *h = &we->hits[p];
+                hits_insert(&em, h->pass_idx, h->enc, h->offset, h->text, h->len,
+                            h->score, h->count);
+            }
+        }
+        if (em.oom) goto nomem;
+        print_ranked(&em);
+    }
 
     if (fflush(stdout) != 0) {
         fprintf(stderr, "%s: write error: %s\n", progname, strerror(errno));
@@ -1432,12 +1733,21 @@ nomem:
 
 out:
     if (file != NULL && file != stdin) fclose(file);
-    for (p = 0; p < em.n_hits; p++) free(em.hits[p].text);
-    free(em.hits);
-    free(em.table);
-    free(em.run);
+    for (w = 0; w < n_started; w++) pthread_join(workers[w].thread, NULL);
+    if (workers != NULL) {
+        for (w = 0; w < n_threads; w++) {
+            emitter_free(&workers[w].em);
+            free(workers[w].work);
+        }
+    }
+    if (sw.slots != NULL) {
+        for (p = 0; p < pl.n; p++) free(sw.slots[p].data);
+    }
+    free(sw.slots);
+    free(sw.done);
+    free(workers);
+    emitter_free(&em);
     free(pl.v);
-    free(work);
     free(buf);
     return status;
 }

@@ -5,6 +5,7 @@
 # the warnings and the language standard back off.
 CFLAGS   ?= -O2
 WARNINGS ?= -Wall -Wextra -std=c11 -pedantic
+THREADS  ?= -pthread
 CPPFLAGS ?=
 LDFLAGS  ?=
 LDLIBS   ?=
@@ -18,7 +19,7 @@ TARGET = hstrings
 all: $(TARGET)
 
 $(TARGET): $(TARGET).c
-	$(CC) $(CPPFLAGS) $(WARNINGS) $(CFLAGS) $(LDFLAGS) $< -o $@ $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(WARNINGS) $(THREADS) $(CFLAGS) $(LDFLAGS) $< -o $@ $(LDLIBS)
 
 test check: $(TARGET)
 	./tests/run_tests.sh ./$(TARGET)
