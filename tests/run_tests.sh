@@ -40,20 +40,21 @@ HelloWorld" \
     "$("$HSTRINGS" --xor=0 hello.bin)"
 
 # A run of exactly the minimum length is kept whole.
-printf 'abc\000' > abc.bin
+printf 'abcd\000' > abcd.bin
 check "run of exactly min length" \
     "XOR-0x00:
-abc" \
-    "$("$HSTRINGS" --xor=0 abc.bin)"
+abcd" \
+    "$("$HSTRINGS" --xor=0 abcd.bin)"
 
 # A run below the minimum length produces nothing, header included.
+printf 'abc\000' > abc.bin
 printf 'ab\000' > ab.bin
-check "short run is dropped" "" "$("$HSTRINGS" --xor=0 ab.bin)"
+check "short run is dropped" "" "$("$HSTRINGS" --xor=0 abc.bin)"
 
 check "-n lowers the threshold" \
     "XOR-0x00:
-ab" \
-    "$("$HSTRINGS" --xor=0 -n 2 ab.bin)"
+abc" \
+    "$("$HSTRINGS" --xor=0 -n 3 abc.bin)"
 
 check "--min-len= long form" \
     "XOR-0x00:
@@ -93,6 +94,33 @@ open('ror2.bin','wb').write(bytes(((b << 2) | (b >> 6)) & 0xFF for b in d))
 open('xor5a.bin','wb').write(bytes(b ^ 0x5A for b in d))
 n = int.from_bytes(d, 'big') << 3
 open('shift.bin','wb').write(n.to_bytes(len(d) + 1, 'big'))
+pad = b'\x00' * 8
+open('add.bin','wb').write(pad + bytes((b - 0x1F) & 0xFF for b in d) + pad)
+open('bitrev.bin','wb').write(pad + bytes(int(format(b, '08b')[::-1], 2) for b in d) + pad)
+p = pad + d + pad
+open('xorinc.bin','wb').write(bytes(b ^ ((0x10 + i) & 0xFF) for i, b in enumerate(p)))
+open('xordec.bin','wb').write(bytes(b ^ ((0x10 - i) & 0xFF) for i, b in enumerate(p)))
+c = bytearray(); prev = 0
+for b in p:
+    prev = b ^ prev; c.append(prev)
+open('xorchain.bin','wb').write(c)
+key = bytes.fromhex('DEADBEEF'); z = b'\x00' * 200
+open('xorkey.bin','wb').write(bytes(b ^ key[i % 4] for i, b in enumerate(z + d + z)))
+open('rotxor.bin','wb').write(pad + bytes((((b ^ 0x5A) >> 3) | ((b ^ 0x5A) << 5)) & 0xFF for b in d) + pad)
+import base64
+open('b64.bin','wb').write(b'\x00\x01' + base64.b64encode(b'Base64 hidden text!') + b'\x02\x00garbage')
+open('hex.bin','wb').write(b'\x00' + b'4865782068696464656e' + b'\x00')
+open('wide_le.bin','wb').write(pad + d.decode().encode('utf-16-le') + pad)
+open('wide_be.bin','wb').write(pad + d.decode().encode('utf-16-be') + pad)
+open('wide32le.bin','wb').write(pad + d.decode().encode('utf-32-le') + pad)
+open('wide32be.bin','wb').write(pad + d.decode().encode('utf-32-be') + pad)
+open('wide_xor.bin','wb').write(bytes(b ^ 0x33 for b in pad + d.decode().encode('utf-16-le') + pad))
+import random
+random.seed(7)
+noise = bytes(random.getrandbits(8) for _ in range(4000))
+open('mixed.bin','wb').write(noise[:2000] + b'kernel32.dll\x00' + bytes(b ^ 0x5A for b in b'http://evil.example.com/gate.php\x00')
+    + b'This is a readable sentence hidden in the file.\x00' + b'x7#Kq~^|{}\x00' + b'AAAAAAAAAAAAAAAA\x00'
+    + b'kernel32.dll\x00' + noise[2000:])
 " || { echo "python3 required for the transform tests" >&2; exit 1; }
 
 check "ROL pass recovers rotated text" \
@@ -116,6 +144,102 @@ check "SHL pass recovers bit-shifted text" \
     "SHL-5:
 RotatedSecret" \
     "$("$HSTRINGS" --shl shift.bin | grep -B1 RotatedSecret)"
+
+check "ADD pass recovers subtracted text" \
+    "ADD-0x1F:
+RotatedSecret" \
+    "$("$HSTRINGS" --add add.bin | grep -B1 RotatedSecret)"
+
+check "BITREV pass recovers bit-reversed text" \
+    "BITREV:
+RotatedSecret" \
+    "$("$HSTRINGS" --bitrev bitrev.bin | grep -B1 RotatedSecret)"
+
+check "XORINC pass recovers incrementing rolling XOR" \
+    "XORINC-0x10:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor-roll xorinc.bin | grep -B1 '^RotatedSecret$' | head -2)"
+
+check "XORDEC pass recovers decrementing rolling XOR" \
+    "XORDEC-0x10:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor-roll xordec.bin | grep -B1 '^RotatedSecret$' | head -2)"
+
+check "XORCHAIN pass recovers chained XOR" \
+    "XORCHAIN:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor-chain xorchain.bin | grep -B1 RotatedSecret)"
+
+check "multi-byte --xor=KEY" \
+    "XORKEY-DEADBEEF:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor=0xDEADBEEF xorkey.bin | grep -B1 RotatedSecret)"
+
+check "--xor-guess finds a 4-byte key from byte frequencies" \
+    "XORKEY-DEADBEEF:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor-guess xorkey.bin | grep -B1 RotatedSecret)"
+
+check "--rotxor recovers rotate-then-XOR" \
+    "ROL-3+XOR-0x5A:" \
+    "$("$HSTRINGS" --rotxor -n 13 rotxor.bin | grep -B1 'ZZZZZZZZRotatedSecretZZZZZZZZ' | head -1)"
+
+check "--base64 decodes an embedded base64 run" \
+    "BASE64:
+Base64 hidden text!" \
+    "$("$HSTRINGS" --base64 b64.bin)"
+
+check "--hex decodes an embedded hex run" \
+    "HEX:
+Hex hidden" \
+    "$("$HSTRINGS" --hex hex.bin)"
+
+check "identifiers are not mistaken for base64" "" \
+    "$("$HSTRINGS" --base64 hello.bin)"
+
+# Wide encodings.
+check "16-bit LE strings are found by default" \
+    "XOR-0x00/16LE:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor=0 wide_le.bin)"
+check "16-bit BE with -e b" \
+    "XOR-0x00/16BE:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor=0 -e b wide_be.bin)"
+check "32-bit LE with -e L" \
+    "XOR-0x00/32LE:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor=0 -e L wide32le.bin)"
+check "32-bit BE with -e B" \
+    "XOR-0x00/32BE:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor=0 -e B wide32be.bin)"
+check "-e s excludes wide strings" "" "$("$HSTRINGS" --xor=0 -e s wide_le.bin)"
+check "XORed 16-bit LE string is recovered" \
+    "XOR-0x33/16LE:
+RotatedSecret" \
+    "$("$HSTRINGS" --xor wide_xor.bin | grep -B1 RotatedSecret)"
+
+# Ranking.
+# The three real strings in the fixture must be the top three, ahead of
+# the thousands of printable runs the noise produces.
+top3=$("$HSTRINGS" --rank --top=3 --xor mixed.bin)
+check "--rank puts the URL in the top three" "1" \
+    "$(printf '%s\n' "$top3" | grep -c 'http://evil.example.com/gate.php')"
+check "--rank puts the DLL name in the top three" "1" \
+    "$(printf '%s\n' "$top3" | grep -c 'kernel32.dll')"
+check "--rank puts the sentence in the top three" "1" \
+    "$(printf '%s\n' "$top3" | grep -c 'This is a readable sentence hidden in the file.')"
+check "--rank drops duplicates and counts them" "1" \
+    "$("$HSTRINGS" --rank --top=0 --xor=0 mixed.bin | grep -c 'kernel32.dll  \[x2\]')"
+check "--rank scores junk low" "1" \
+    "$("$HSTRINGS" --rank --top=0 --xor=0 mixed.bin | grep -E '^ *[0-9]+  ' | awk '/x7#Kq/ { print ($1 < 40) ? 1 : 0 }')"
+check "--rank scores a repeated character low" "1" \
+    "$("$HSTRINGS" --rank --top=0 --xor=0 mixed.bin | awk '/AAAAAAAAAAAAAAAA/ { print ($1 < 30) ? 1 : 0 }')"
+check "--top limits the ranked list" "2" \
+    "$("$HSTRINGS" --rank --top=2 --xor=0 mixed.bin | wc -l | tr -d ' ')"
+check "--rank with -t shows offsets" "1" \
+    "$("$HSTRINGS" --rank --top=1 --xor=0 -t d mixed.bin | grep -cE '^100  XOR-0x00 +[0-9]+ kernel32.dll')"
 
 # Input sources.
 check "reads stdin" \
@@ -143,8 +267,16 @@ check "unknown option exits 1" "1" "$?"
 check "-n 0 is rejected" "1" "$?"
 "$HSTRINGS" -t q hello.bin > /dev/null 2>&1
 check "invalid radix is rejected" "1" "$?"
-"$HSTRINGS" --xor=0x100 hello.bin > /dev/null 2>&1
+"$HSTRINGS" --xor=256 hello.bin > /dev/null 2>&1
 check "out-of-range XOR key is rejected" "1" "$?"
+"$HSTRINGS" --xor=0x123 hello.bin > /dev/null 2>&1
+check "odd-length hex XOR key is rejected" "1" "$?"
+"$HSTRINGS" --top=5 hello.bin > /dev/null 2>&1
+check "--top without --rank is rejected" "1" "$?"
+"$HSTRINGS" -e q hello.bin > /dev/null 2>&1
+check "invalid encoding letter is rejected" "1" "$?"
+"$HSTRINGS" --xor-guess=0 hello.bin > /dev/null 2>&1
+check "--xor-guess=0 is rejected" "1" "$?"
 check "usage goes to stdout for --help" "1" \
     "$("$HSTRINGS" --help 2>/dev/null | grep -c '^Usage:')"
 
