@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  build:
+    name: build and test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+      - name: Test
+        run: make test CC=${{ matrix.cc }}
+
+  sanitizers:
+    name: address and undefined behaviour sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        run: make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Test
+        run: ./tests/run_tests.sh ./hstrings
+
+  install:
+    name: install and uninstall into a staging root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - run: make install DESTDIR="$PWD/stage"
+      - run: test -x "$PWD/stage/usr/local/bin/hstrings"
+      - run: make uninstall DESTDIR="$PWD/stage"
+      - run: test ! -e "$PWD/stage/usr/local/bin/hstrings"

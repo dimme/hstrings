@@ -1,73 +1,122 @@
 # hstrings
 
-`hstrings` is a command-line tool for finding and displaying hidden continuous sequences of printable characters within a binary file or stdin input. The tool rotates the input bytes using various left-right rotations and XOR operations before searching for printable character sequences. The output is color-coded for each type of operation.
+`hstrings` finds continuous sequences of printable characters hidden inside a
+binary file or on standard input. Plain `strings` only sees text that is stored
+verbatim; `hstrings` first transforms the input in a number of ways, so text
+that was rotated, bit-shifted or XORed shows up too. The output is colour-coded
+by transform.
+
+## Transforms
+
+| Header    | Transform                                                          |
+| --------- | ------------------------------------------------------------------ |
+| `ROL-N`   | each byte rotated left by N bits (red)                              |
+| `ROR-N`   | each byte rotated right by N bits (blue)                            |
+| `SHL-N`   | the whole bit stream shifted left by N bits (magenta)               |
+| `XOR-0xNN`| every byte XORed with the key `0xNN` (green)                        |
+
+`ROL`/`ROR` rotate each byte on its own, which is what you want when the data
+was obfuscated byte by byte. `SHL` shifts the entire bit stream, which is what
+you want when the text sits at an offset that is not a multiple of eight bits —
+there the bits of one character are split across two input bytes, and a per-byte
+rotation recovers only a garbled version of it. Shifting the stream right by N
+bits yields the same characters as shifting it left by 8 - N, so only the left
+direction is generated.
+
+With no transform option, `hstrings` runs the seven distinct byte rotations
+(`ROL-4` and `ROR-4` are the same rotation, so it is listed once), the seven bit
+stream shifts, and all 256 XOR keys. A pass that finds nothing prints no header.
+
+## Building
+
+```bash
+make          # build
+make test     # build and run the test suite
+```
+
+`CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS` and `PREFIX` can be overridden:
+
+```bash
+make CC=clang CFLAGS="-O1 -g -fsanitize=address,undefined"
+```
 
 ## Usage
-To compile the program, simply run:
-```bash
-make
+
+```
+hstrings [OPTION]... [FILE]
 ```
 
-To use the program with a binary file, run:
-```bash
-./hstrings <binary_file>
-```
+With no `FILE`, or when `FILE` is `-`, input is read from standard input.
 
-To use the program with input from stdin, run:
-```bash
-./hstrings < input_file
-```
-or
-```bash
-cat input_file | ./hstrings
-```
+| Option              | Meaning                                                      |
+| ------------------- | ------------------------------------------------------------ |
+| `-n`, `--min-len=LEN` | print runs of at least LEN characters (default 3)          |
+| `-t`, `--radix=RADIX` | print the offset of each run; RADIX is `d`, `x` or `o`     |
+| `--color[=WHEN]`    | colourise headers; WHEN is `auto` (default), `always`, `never` |
+| `--rol`             | run the `ROL-1`..`ROL-7` passes                              |
+| `--ror`             | run the `ROR-1`..`ROR-7` passes                              |
+| `--shl`             | run the `SHL-1`..`SHL-7` passes                              |
+| `--xor[=KEY]`       | run every XOR key, or just KEY (e.g. `0x4F`)                 |
+| `-h`, `--help`      | display help and exit                                        |
+| `-V`, `--version`   | output version information and exit                          |
 
-## Output
-The program will print continuous sequences of printable characters that are 3 characters or longer on separate lines. The output is color-coded based on the type of rotation applied to the input bytes:
+Colour is written only when standard output is a terminal, so piping into
+`grep` or `less` gives clean text.
 
--   Red: Left rotations (ROL)
--   Blue: Right rotations (ROR)
--   Green: XOR operation
+## Examples
 
-Before each set of sequences, the program prints the rotation type and the number of bits rotated, in the format `ROL-X`, `ROR-X` or `XOR-X` where `X` is the number of bits or key used.
+Scan a file with every transform:
 
-## Example
-
-Suppose you have a binary file named `sample.bin`. To use the `hstrings` tool on this file, run:
 ```bash
 ./hstrings sample.bin
 ```
 
-The program will display the continuous sequences of printable characters for each rotation:
 ```
 ROL-4:
 (sequence 1)
 (sequence 2)
-...
 ROR-1:
 (sequence 1)
-(sequence 2)
-...
 XOR-0x4F:
 (sequence 1)
-(sequence 2)
-...
+```
+
+The full sweep is 270 passes and produces a lot of output, so it is usually
+worth narrowing it down. Longer runs only, with offsets, from a single
+transform family:
+
+```bash
+./hstrings --xor -n 8 -t x sample.bin
+```
+
+Read from standard input:
+
+```bash
+cat sample.bin | ./hstrings --shl
 ```
 
 ## Installation
-To install the program, run:
+
 ```bash
-make install
+sudo make install      # into /usr/local/bin
+sudo make uninstall
 ```
 
-This command will install the `hstrings` tool to `/usr/local/bin`. You may need to run `sudo make install` to install with the required permissions.
+`PREFIX`, `BINDIR` and `DESTDIR` are honoured, so packaging works as expected:
 
-To uninstall the program, run:
 ```bash
-make uninstall
+make install DESTDIR=/tmp/stage PREFIX=/usr
 ```
 
-This command will remove the `hstrings` tool from `/usr/local/bin`. You may need to run `sudo make uninstall` to remove the program with the required permissions.
+## Tests
+
+```bash
+make test
+```
+
+The suite covers the transforms, the minimum-length and offset options, colour
+handling, input sources, and the exit statuses. It needs `python3` to build the
+transformed fixtures.
 
 ## License
 
