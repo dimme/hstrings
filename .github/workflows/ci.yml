@@ -30,6 +30,16 @@ jobs:
       - name: Test
         run: ./tests/run_tests.sh ./hstrings
 
+  tsan:
+    name: thread sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ThreadSanitizer
+        run: make CFLAGS="-O1 -g -fsanitize=thread"
+      - name: Test
+        run: ./tests/run_tests.sh ./hstrings
+
   install:
     name: install and uninstall into a staging root
     runs-on: ubuntu-latest

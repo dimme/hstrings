@@ -241,6 +241,24 @@ check "--top limits the ranked list" "2" \
 check "--rank with -t shows offsets" "1" \
     "$("$HSTRINGS" --rank --top=1 --xor=0 -t d mixed.bin | grep -cE '^100  XOR-0x00 +[0-9]+ kernel32.dll')"
 
+# Threads: the output must not depend on the thread count.
+check "-j 1 and -j 3 give identical output" \
+    "$("$HSTRINGS" -j 1 -t x mixed.bin | cksum)" \
+    "$("$HSTRINGS" -j 3 -t x mixed.bin | cksum)"
+check "-j 1 and -j 3 give identical ranked output" \
+    "$("$HSTRINGS" -j 1 --rank --top=0 -t x mixed.bin | cksum)" \
+    "$("$HSTRINGS" -j 3 --rank --top=0 -t x mixed.bin | cksum)"
+check "-j 1 and -j 4 give identical ranked output with a small --top" \
+    "$("$HSTRINGS" -j 1 --rank --top=5 mixed.bin | cksum)" \
+    "$("$HSTRINGS" --threads=4 --rank --top=5 mixed.bin | cksum)"
+check "-j 1 and -j 4 agree on all encodings and --rotxor" \
+    "$("$HSTRINGS" -j 1 -e s,l,b,L,B --rotxor -n 6 rol3.bin | cksum)" \
+    "$("$HSTRINGS" -j 4 -e s,l,b,L,B --rotxor -n 6 rol3.bin | cksum)"
+check "more threads than passes is fine" \
+    "XOR-0x5A:
+RotatedSecret" \
+    "$("$HSTRINGS" -j 64 --xor=0x5A xor5a.bin)"
+
 # Input sources.
 check "reads stdin" \
     "XOR-0x00:
@@ -277,6 +295,8 @@ check "--top without --rank is rejected" "1" "$?"
 check "invalid encoding letter is rejected" "1" "$?"
 "$HSTRINGS" --xor-guess=0 hello.bin > /dev/null 2>&1
 check "--xor-guess=0 is rejected" "1" "$?"
+"$HSTRINGS" -j 0 hello.bin > /dev/null 2>&1
+check "-j 0 is rejected" "1" "$?"
 check "usage goes to stdout for --help" "1" \
     "$("$HSTRINGS" --help 2>/dev/null | grep -c '^Usage:')"
 
